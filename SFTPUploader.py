@@ -3,6 +3,7 @@ import stat
 import hashlib
 import paramiko
 import argparse
+from tqdm import tqdm
 from colorama import init, Fore, Style
 
 # Initialize colorama
@@ -78,6 +79,17 @@ def ensure_remote_dir_exists(sftp, remote_dir):
         except Exception as e:
             print(f"{Fore.RED}Failed to create directory {remote_dir}: {e}")
 
+def upload_with_progress(sftp, local_path, remote_file_path):
+    """Upload a file to the remote server with a progress bar."""
+    file_size = os.path.getsize(local_path)
+    
+    with tqdm(total=file_size, unit='B', unit_scale=True, desc=local_path, ncols=100, ascii=True) as progress_bar:
+        with open(local_path, 'rb') as f:
+            with sftp.file(remote_file_path, 'wb') as remote_file:
+                while chunk := f.read(8192):
+                    remote_file.write(chunk)
+                    progress_bar.update(len(chunk))
+
 def upload_files_sftp(sftp, local_path, remote_path, remote_files, counters, root_local_path, compare_hashes, replace_policy):
     """Upload files and directories recursively to an SFTP server, handling differences."""
     try:
@@ -102,7 +114,11 @@ def upload_files_sftp(sftp, local_path, remote_path, remote_files, counters, roo
                         print(f"{Fore.RED}Hashes differ. Handling file: {local_path}")
                         action = determine_action_for_different_file(local_path, replace_policy)
                         if action == "replace":
-                            replace_file(sftp, local_path, remote_file_path, counters)
+                            print(f"{Fore.MAGENTA}Starting upload: {local_path} -> {remote_file_path}")
+                            upload_with_progress(sftp, local_path, remote_file_path)
+                            print(f"{Fore.GREEN}Completed upload: {local_path}")
+                            counters['uploaded'] += 1
+                            counters['total_size'] += os.path.getsize(local_path)
                         else:
                             print(f"{Fore.YELLOW}Skipped different file: {local_path}")
                             counters['skipped'] += 1
@@ -111,7 +127,11 @@ def upload_files_sftp(sftp, local_path, remote_path, remote_files, counters, roo
                     counters['skipped'] += 1
             else:
                 print(f"{Fore.GREEN}Uploading new file: {local_path}")
-                replace_file(sftp, local_path, remote_file_path, counters)
+                print(f"{Fore.MAGENTA}Starting upload: {local_path} -> {remote_file_path}")
+                upload_with_progress(sftp, local_path, remote_file_path)
+                print(f"{Fore.GREEN}Completed upload: {local_path}")
+                counters['uploaded'] += 1
+                counters['total_size'] += os.path.getsize(local_path)
 
         elif os.path.isdir(local_path):
             for item in os.listdir(local_path):
