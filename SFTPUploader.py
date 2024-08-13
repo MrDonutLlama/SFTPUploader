@@ -20,19 +20,25 @@ def read_config(file_path):
             config[key.strip()] = value.strip()
     return config
 
-def list_remote_files(sftp, remote_path):
-    """List all files in the remote directory recursively and store their paths and hashes."""
+def list_remote_files(sftp, remote_path, compare_hashes):
+    """List all files in the remote directory recursively and store their paths and hashes if required."""
     remote_files = {}
     try:
         for entry in sftp.listdir_attr(remote_path):
             remote_file_path = os.path.join(remote_path, entry.filename).replace("\\", "/")
             if stat.S_ISDIR(entry.st_mode):
-                remote_files.update(list_remote_files(sftp, remote_file_path))
+                remote_files.update(list_remote_files(sftp, remote_file_path, compare_hashes))
             else:
-                remote_files[remote_file_path] = {
-                    "path": remote_file_path,
-                    "hash": get_remote_file_hash(sftp, remote_file_path)
-                }
+                if compare_hashes:
+                    print(f"{Fore.BLUE}Calculating hash for remote file: {remote_file_path}")
+                    remote_files[remote_file_path] = {
+                        "path": remote_file_path,
+                        "hash": get_remote_file_hash(sftp, remote_file_path)
+                    }
+                else:
+                    remote_files[remote_file_path] = {
+                        "path": remote_file_path
+                    }
     except FileNotFoundError:
         print(f"{Fore.RED}Remote path does not exist: {remote_path}")
     return remote_files
@@ -40,6 +46,7 @@ def list_remote_files(sftp, remote_path):
 def get_file_hash(file_path):
     """Calculate the SHA-256 hash of a local file."""
     sha256 = hashlib.sha256()
+    print(f"{Fore.BLUE}Calculating hash for local file: {file_path}")
     with open(file_path, 'rb') as f:
         while chunk := f.read(8192):
             sha256.update(chunk)
@@ -71,7 +78,7 @@ def ensure_remote_dir_exists(sftp, remote_dir):
         except Exception as e:
             print(f"{Fore.RED}Failed to create directory {remote_dir}: {e}")
 
-def upload_files_sftp(sftp, local_path, remote_path, remote_files, counters, root_local_path, replace_policy):
+def upload_files_sftp(sftp, local_path, remote_path, remote_files, counters, root_local_path, compare_hashes):
     """Upload files and directories recursively to an SFTP server, handling differences."""
     try:
         if os.path.isfile(local_path):
@@ -82,27 +89,30 @@ def upload_files_sftp(sftp, local_path, remote_path, remote_files, counters, roo
             remote_dir = os.path.dirname(remote_file_path)
             ensure_remote_dir_exists(sftp, remote_dir)
 
-            local_hash = get_file_hash(local_path)
             remote_file_info = remote_files.get(remote_file_path)
 
             if remote_file_info:
-                remote_hash = remote_file_info["hash"]
-                if local_hash == remote_hash:
-                    print(f"{Fore.YELLOW}Skipped identical file: {local_path}")
-                    counters['skipped'] += 1
-                else:
-                    action = determine_action_for_different_file(local_path, replace_policy)
-                    if action == "replace":
-                        replace_file(sftp, local_path, remote_file_path, counters)
-                    else:
-                        print(f"{Fore.YELLOW}Skipped different file: {local_path}")
+                if compare_hashes:
+                    local_hash = get_file_hash(local_path)
+                    remote_hash = remote_file_info.get("hash")
+                    if remote_hash and local_hash == remote_hash:
+                        print(f"{Fore.YELLOW}Hashes match. Skipping file: {local_path}")
                         counters['skipped'] += 1
+                    else:
+                        print(f"{Fore.RED}Hashes differ. Replacing file: {local_path}")
+                        replace_file(sftp, local_path, remote_file_path, counters)
+                else:
+                    # Skip file if a duplicate name is found and hashes are not being compared
+                    print(f"{Fore.YELLOW}Duplicate file found. Skipping file: {local_path}")
+                    counters['skipped'] += 1
             else:
+                print(f"{Fore.GREEN}Uploading new file: {local_path}")
                 replace_file(sftp, local_path, remote_file_path, counters)
+
         elif os.path.isdir(local_path):
             for item in os.listdir(local_path):
                 local_item_path = os.path.join(local_path, item)
-                upload_files_sftp(sftp, local_item_path, remote_path, remote_files, counters, root_local_path, replace_policy)
+                upload_files_sftp(sftp, local_item_path, remote_path, remote_files, counters, root_local_path, compare_hashes)
     except FileNotFoundError as e:
         print(f"{Fore.RED}File not found: {local_path} or {remote_file_path}. Error: {e}")
     except Exception as e:
@@ -117,21 +127,7 @@ def replace_file(sftp, local_path, remote_file_path, counters):
     counters['uploaded'] += 1
     counters['total_size'] += file_size
 
-def determine_action_for_different_file(local_path, replace_policy):
-    """Determine the action to take for a file that is different between local and remote."""
-    if replace_policy == "replace_all":
-        return "replace"
-    elif replace_policy == "skip_all":
-        return "skip"
-    else:  # Ask for each file
-        while True:
-            response = input(f"{Fore.YELLOW}File '{local_path}' is different. Replace? (y/n): {Style.RESET_ALL}").strip().lower()
-            if response == 'y':
-                return "replace"
-            elif response == 'n':
-                return "skip"
-
-def connect_and_upload(config, local_path, replace_policy):
+def connect_and_upload(config, local_path, compare_hashes):
     """Establish SFTP connection and upload files."""
     sftp = None  # Initialize sftp variable
     try:
@@ -154,11 +150,11 @@ def connect_and_upload(config, local_path, replace_policy):
         remote_base_folder = os.path.join(config['remote_path'], local_base_folder).replace("\\", "/")
         ensure_remote_dir_exists(sftp, remote_base_folder)
 
-        remote_files = list_remote_files(sftp, remote_base_folder)
+        remote_files = list_remote_files(sftp, remote_base_folder, compare_hashes)
 
         counters = {'uploaded': 0, 'skipped': 0, 'total_size': 0}
 
-        upload_files_sftp(sftp, local_path, remote_base_folder, remote_files, counters, local_path, replace_policy)
+        upload_files_sftp(sftp, local_path, remote_base_folder, remote_files, counters, local_path, compare_hashes)
 
         print(f"\n{Style.BRIGHT}Upload Summary:")
         print(f"{Fore.GREEN}Total files uploaded: {counters['uploaded']}")
@@ -184,26 +180,34 @@ def choose_config(config_folder):
         display_name = os.path.splitext(file_name)[0]
         print(f"{Fore.CYAN}{i}. {display_name}")
 
-    choice = int(input(f"{Style.BRIGHT}Enter the number of the configuration file to use: "))
-    selected_file = config_files[choice - 1]
-    return os.path.join(config_folder, selected_file)
+    while True:
+        try:
+            choice = int(input(f"{Style.BRIGHT}Enter the number of the configuration file to use: "))
+            if 1 <= choice <= len(config_files):
+                selected_file = config_files[choice - 1]
+                return os.path.join(config_folder, selected_file)
+            else:
+                print(f"{Fore.RED}Invalid choice. Please enter a number between 1 and {len(config_files)}.")
+        except ValueError:
+            print(f"{Fore.RED}Invalid input. Please enter a number.")
 
-def choose_replace_policy():
-    """Prompt the user to choose a replace policy for handling different files."""
-    print(f"{Style.BRIGHT}\nHow would you like to handle files with different hashes?")
-    print(f"{Fore.GREEN}1. Replace all duplicate files with different hashes")
-    print(f"{Fore.YELLOW}2. Skip all duplicate files with different hashes")
-    print(f"{Fore.CYAN}3. Ask for each duplicate file with a different hash")
-    choice = int(input(f"{Style.BRIGHT}Enter your choice (1/2/3): {Style.RESET_ALL}"))
-    if choice == 1:
-        return "replace_all"
-    elif choice == 2:
-        return "skip_all"
-    elif choice == 3:
-        return "ask_each"
-    else:
-        print(f"{Fore.RED}Invalid choice. Defaulting to asking for each file.")
-        return "ask_each"
+def choose_compare_hashes():
+    """Prompt the user to choose whether to compare hashes or not."""
+    print(f"{Style.BRIGHT}\nWould you like to compare file hashes before uploading?")
+    print(f"{Fore.GREEN}1. Yes, compare file hashes")
+    print(f"{Fore.YELLOW}2. No, upload files without comparing hashes")
+    
+    while True:
+        try:
+            choice = int(input(f"{Style.BRIGHT}Enter your choice (1/2): {Style.RESET_ALL}"))
+            if choice == 1:
+                return True
+            elif choice == 2:
+                return False
+            else:
+                print(f"{Fore.RED}Invalid choice. Please enter 1 or 2.")
+        except ValueError:
+            print(f"{Fore.RED}Invalid input. Please enter 1 or 2.")
 
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description="Upload files to an SFTP server, avoiding duplicates.")
@@ -217,6 +221,6 @@ if __name__ == "__main__":
 
     config = read_config(config_file_path)
 
-    replace_policy = choose_replace_policy()
+    compare_hashes = choose_compare_hashes()
 
-    connect_and_upload(config, args.local_path, replace_policy)
+    connect_and_upload(config, args.local_path, compare_hashes)
